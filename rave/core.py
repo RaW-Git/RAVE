@@ -333,6 +333,9 @@ class AudioDistanceV1(nn.Module):
         distance = 0.
 
         for x, y in zip(stfts_x, stfts_y):
+            x = torch.view_as_complex(x).abs()
+            y = torch.view_as_complex(y).abs()
+
             logx = torch.log(x + self.log_epsilon)
             logy = torch.log(y + self.log_epsilon)
 
@@ -344,7 +347,7 @@ class AudioDistanceV1(nn.Module):
         return {'spectral_distance': distance}
 
 
-class WeightedInstantaneousSpectralDistance(nn.Module):
+class AudioDistanceV2(nn.Module):
 
     def __init__(self,
                  multiscale_stft: Callable[[], MultiScaleSTFT],
@@ -352,63 +355,60 @@ class WeightedInstantaneousSpectralDistance(nn.Module):
         super().__init__()
         self.multiscale_stft = multiscale_stft()
         self.weighted = weighted
-
-    def phase_to_instantaneous_frequency(self,
-                                         x: torch.Tensor) -> torch.Tensor:
-        x = self.unwrap(x)
-        x = self.derivative(x)
-        return x
+        self.eps = 1e-6
 
     def derivative(self, x: torch.Tensor) -> torch.Tensor:
-        return x[..., 1:] - x[..., :-1]
-
-    def unwrap(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.derivative(x)
-        x = (x + np.pi) % (2 * np.pi)
-        return (x - np.pi).cumsum(-1)
+        return x[..., 1:, :] - x[..., :-1, :]
+    
+    def autocorr_from_fft(self, fft: torch.Tensor) -> torch.Tensor:
+        return torch.fft.irfft(fft * fft.conj())
 
     def forward(self, target: torch.Tensor, pred: torch.Tensor):
         stfts_x = self.multiscale_stft(target)
         stfts_y = self.multiscale_stft(pred)
         spectral_distance = 0.
         phase_distance = 0.
+        correlation_distance = 0.
 
         for x, y in zip(stfts_x, stfts_y):
             assert x.shape[-1] == 2
 
-            x = torch.view_as_complex(x)
-            y = torch.view_as_complex(y)
+            x_c = torch.view_as_complex(x)
+            y_c = torch.view_as_complex(y)
 
             # AMPLITUDE DISTANCE
-            x_abs = x.abs()
-            y_abs = y.abs()
+            x_abs = x_c.abs()
+            y_abs = y_c.abs()
 
             logx = torch.log1p(x_abs)
             logy = torch.log1p(y_abs)
 
-            lin_distance = mean_difference(x_abs,
-                                           y_abs,
-                                           norm='L2',
-                                           relative=True)
+            lin_distance = mean_difference(x_abs, y_abs, norm='L2', relative=True)
             log_distance = mean_difference(logx, logy, norm='L1')
 
             spectral_distance = spectral_distance + lin_distance + log_distance
 
-            # PHASE DISTANCE
-            x_if = self.phase_to_instantaneous_frequency(x.angle())
-            y_if = self.phase_to_instantaneous_frequency(y.angle())
+            # PHASE DISTANCE - Cosine distance between normalized masked Phase differences
+            x_pdiff = self.derivative(x / (x_abs.unsqueeze(-1) + self.eps))
+            y_pdiff = self.derivative(y / (y_abs.unsqueeze(-1) + self.eps))
 
             if self.weighted:
-                mask = torch.clip(torch.log1p(x_abs[..., 2:]), 0, 1)
-                x_if = x_if * mask
-                y_if = y_if * mask
+                mask = torch.clip(torch.log1p(x_abs[..., 1:]), 0, 1)
+                x_pdiff = x_pdiff * mask.unsqueeze(-1)
+                y_pdiff = y_pdiff * mask.unsqueeze(-1)
 
-            phase_distance = phase_distance + mean_difference(
-                x_if, y_if, norm='L2')
+            # Cosine distance between normalized
+            phase_distance = phase_distance - (x_pdiff * y_pdiff).mean()
+
+            # AUTOCORRELATION DISTANCE
+            x_corr = self.autocorr_from_fft(x_c)
+            y_corr = self.autocorr_from_fft(y_c)
+            correlation_distance = correlation_distance + mean_difference(x_corr, y_corr, norm='L1')
 
         return {
             'spectral_distance': spectral_distance,
-            'phase_distance': phase_distance
+            'phase_distance': phase_distance,
+            'auto_correlation_distance': correlation_distance,
         }
 
 
