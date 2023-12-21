@@ -341,8 +341,9 @@ class AudioDistanceV1(nn.Module):
 
             lin_distance = mean_difference(x, y, norm='L2', relative=True)
             log_distance = mean_difference(logx, logy, norm='L1')
+            pow_distance = mean_difference(x**2, y**2, norm='L2', relative=True)
 
-            distance = distance + lin_distance + log_distance
+            distance = distance + lin_distance + log_distance + pow_distance
 
         return {'spectral_distance': distance}
 
